@@ -1,12 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
+const http = require('http');
+const socketIo = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"]
+  }
+});
+
 app.use(cors());
 app.use(express.json());
 
-// Create DB
 const db = new sqlite3.Database('./auction.db');
 
 // Create table
@@ -20,20 +29,42 @@ db.serialize(() => {
   `);
 });
 
-// Auction end time (2 minutes)
-const auctionEndTime = new Date().getTime() + 2 * 60 * 1000;
+// Dynamic auction time (resets)
+let auctionEndTime;
 
-// API: Get highest bid
+const resetAuction = () => {
+  auctionEndTime = new Date().getTime() + 2 * 60 * 1000;
+
+  // Optional: clear old bids
+  db.run(`DELETE FROM bids`);
+};
+
+// Call once initially
+resetAuction();
+
+// API to reset auction (called from frontend refresh)
+app.post('/reset', (req, res) => {
+  resetAuction();
+  res.json({ message: 'Auction reset' });
+});
+
+// Get highest bid
 app.get('/highest-bid', (req, res) => {
   db.get(`SELECT MAX(amount) as highest FROM bids`, (err, row) => {
-    if (err) return res.status(500).send(err);
     res.json({ highestBid: row.highest || 0 });
   });
 });
 
-// API: Place bid
+// Place bid
 app.post('/bid', (req, res) => {
   const { amount } = req.body;
+
+  if (!amount || isNaN(amount) || amount <= 0 || amount > 1000000) {
+    return res.json({
+      success: false,
+      message: 'Enter valid bid (1 - 10,00,000)',
+    });
+  }
 
   const currentTime = new Date().getTime();
 
@@ -54,8 +85,13 @@ app.post('/bid', (req, res) => {
     db.run(
       `INSERT INTO bids (amount, time) VALUES (?, ?)`,
       [amount, new Date().toISOString()],
-      err => {
-        if (err) return res.status(500).send(err);
+      () => {
+        // Emit real-time update to all connected clients
+        io.emit('newBid', {
+          amount,
+          time: new Date().toLocaleTimeString(),
+          date: new Date().toLocaleDateString()
+        });
 
         res.json({ success: true, message: 'Bid placed successfully' });
       }
@@ -63,18 +99,14 @@ app.post('/bid', (req, res) => {
   });
 });
 
-//  NEW API: Get all bids (latest first)
+// Get bid history
 app.get('/bids', (req, res) => {
-  db.all(
-    `SELECT * FROM bids ORDER BY amount DESC`,
-    (err, rows) => {
-      if (err) return res.status(500).send(err);
-      res.json(rows);
-    }
-  );
+  db.all(`SELECT * FROM bids ORDER BY amount DESC`, (err, rows) => {
+    res.json(rows);
+  });
 });
 
-// API: Auction status
+// Status
 app.get('/status', (req, res) => {
   const currentTime = new Date().getTime();
 
@@ -86,6 +118,6 @@ app.get('/status', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
